@@ -1,0 +1,17 @@
+name = "obsidian-cloud-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[r2_buckets]]
+binding = "VAULT_STORAGE"
+bucket_name = "obsidian-vault"
+
+[durable_objects]
+bindings = [
+  { name = "VAULT", class_name = "VaultAgent" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VaultAgent"]

@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-cloud-mcp",
+  "name": "Cloud MCP",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Sync your vault to Cloudflare R2 and expose it as an MCP endpoint for Claude — works from phone, desktop, and web.",
+  "author": "amarisaster",
+  "isDesktopOnly": false
+}
