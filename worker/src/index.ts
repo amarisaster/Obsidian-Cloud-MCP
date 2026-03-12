@@ -124,6 +124,21 @@ export class VaultAgent extends McpAgent<Env> {
 
   private dbReady = false;
 
+  // --- Forward index operations to the canonical "vault" DO ---
+  // McpAgent creates per-session DOs (streamable-http:<sessionId>) with isolated SQLite.
+  // All index reads/writes must route through the single "vault" DO that holds the index.
+
+  private async indexOp(action: string, params: Record<string, any> = {}): Promise<any> {
+    const id = this.env.VAULT.idFromName("vault");
+    const stub = this.env.VAULT.get(id);
+    const resp = await stub.fetch(new Request("http://internal/index", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...params }),
+    }));
+    return resp.json();
+  }
+
   // --- Batched reindex: process N files per alarm invocation ---
 
   private async processReindexBatch(): Promise<{ indexed: number; hasMore: boolean }> {
@@ -191,7 +206,7 @@ export class VaultAgent extends McpAgent<Env> {
     }
   }
 
-  // Handle internal REST calls from the Worker (reindex trigger, status)
+  // Handle internal REST calls from the Worker (reindex trigger, status, index ops)
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -253,6 +268,165 @@ export class VaultAgent extends McpAgent<Env> {
       }), { headers: { "Content-Type": "application/json" } });
     }
 
+    // --- Index operations endpoint (used by MCP tools via indexOp()) ---
+    if (url.pathname === "/index" && request.method === "POST") {
+      this.ensureDB();
+      const body = await request.json() as { action: string; [key: string]: any };
+
+      switch (body.action) {
+        case "stats": {
+          const fileCount = this.ctx.storage.sql.exec(
+            `SELECT COUNT(*) as count FROM files`
+          ).toArray()[0] as any;
+          const totalSize = this.ctx.storage.sql.exec(
+            `SELECT COALESCE(SUM(size_bytes), 0) as total FROM files`
+          ).toArray()[0] as any;
+          const tagCount = this.ctx.storage.sql.exec(
+            `SELECT COUNT(DISTINCT tag) as count FROM tags`
+          ).toArray()[0] as any;
+          const recentFile = this.ctx.storage.sql.exec(
+            `SELECT path, updated_at FROM files ORDER BY updated_at DESC LIMIT 1`
+          ).toArray()[0] as any;
+          return Response.json({
+            files: fileCount?.count || 0,
+            totalSize: totalSize?.total || 0,
+            uniqueTags: tagCount?.count || 0,
+            lastUpdated: recentFile?.updated_at || "never",
+            lastFile: recentFile?.path || "none",
+          });
+        }
+
+        case "search": {
+          const rows = this.ctx.storage.sql.exec(
+            `SELECT path, frontmatter_json FROM files WHERE path LIKE ? ESCAPE '\\' OR frontmatter_json LIKE ? ESCAPE '\\' LIMIT ?`,
+            `%${body.escapedQuery}%`, `%${body.escapedQuery}%`, body.limit || 20
+          ).toArray();
+          return Response.json({ rows });
+        }
+
+        case "recent": {
+          const rows = this.ctx.storage.sql.exec(
+            `SELECT path, size_bytes, updated_at FROM files ORDER BY updated_at DESC LIMIT ?`,
+            body.limit || 20
+          ).toArray();
+          return Response.json({ rows });
+        }
+
+        case "tags_by_tag": {
+          const rows = this.ctx.storage.sql.exec(
+            `SELECT t.path FROM tags t WHERE t.tag = ? LIMIT ?`,
+            body.tag, body.limit || 50
+          ).toArray();
+          return Response.json({ rows });
+        }
+
+        case "tags_all": {
+          const rows = this.ctx.storage.sql.exec(
+            `SELECT tag, COUNT(*) as count FROM tags GROUP BY tag ORDER BY count DESC LIMIT ?`,
+            body.limit || 50
+          ).toArray();
+          return Response.json({ rows });
+        }
+
+        case "files_manifest": {
+          const rows = this.ctx.storage.sql.exec(
+            `SELECT path, content_hash FROM files`
+          ).toArray();
+          return Response.json({ rows });
+        }
+
+        case "tombstones": {
+          const rows = this.ctx.storage.sql.exec(
+            `SELECT path FROM tombstones`
+          ).toArray();
+          return Response.json({ rows });
+        }
+
+        case "status": {
+          const fileCount = this.ctx.storage.sql.exec(
+            `SELECT COUNT(*) as count FROM files`
+          ).toArray()[0] as any;
+          const tombstoneCount = this.ctx.storage.sql.exec(
+            `SELECT COUNT(*) as count FROM tombstones`
+          ).toArray()[0] as any;
+          const reindexActive = await this.ctx.storage.get<boolean>("reindex_active");
+          const reindexCount = await this.ctx.storage.get<number>("reindex_count");
+          return Response.json({
+            indexedFiles: fileCount?.count || 0,
+            pendingDeletes: tombstoneCount?.count || 0,
+            reindexActive: !!reindexActive,
+            reindexCount: reindexCount || 0,
+          });
+        }
+
+        case "upsert_file": {
+          this.ctx.storage.sql.exec(
+            `INSERT OR REPLACE INTO files (path, content_hash, size_bytes, frontmatter_json, updated_at)
+             VALUES (?, ?, ?, ?, datetime('now'))`,
+            body.path, body.hash, body.sizeBytes, body.frontmatterJson
+          );
+          this.ctx.storage.sql.exec(`DELETE FROM tags WHERE path = ?`, body.path);
+          for (const t of body.tags || []) {
+            this.ctx.storage.sql.exec(
+              `INSERT OR IGNORE INTO tags (path, tag) VALUES (?, ?)`,
+              body.path, t
+            );
+          }
+          this.ctx.storage.sql.exec(`DELETE FROM tombstones WHERE path = ?`, body.path);
+          return Response.json({ ok: true });
+        }
+
+        case "delete_file": {
+          this.ctx.storage.sql.exec(`DELETE FROM files WHERE path = ?`, body.path);
+          this.ctx.storage.sql.exec(`DELETE FROM tags WHERE path = ?`, body.path);
+          this.ctx.storage.sql.exec(
+            `INSERT OR REPLACE INTO tombstones (path, deleted_at, deleted_by) VALUES (?, datetime('now'), 'mcp-claude')`,
+            body.path
+          );
+          return Response.json({ ok: true });
+        }
+
+        case "move_file": {
+          const row = this.ctx.storage.sql.exec(
+            `SELECT content_hash, size_bytes, frontmatter_json FROM files WHERE path = ?`,
+            body.fromPath
+          ).toArray()[0] as any;
+
+          if (row) {
+            this.ctx.storage.sql.exec(`DELETE FROM files WHERE path = ?`, body.fromPath);
+            this.ctx.storage.sql.exec(
+              `INSERT OR REPLACE INTO files (path, content_hash, size_bytes, frontmatter_json, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now'))`,
+              body.toPath, row.content_hash, row.size_bytes, row.frontmatter_json
+            );
+            const existingTags = this.ctx.storage.sql.exec(
+              `SELECT tag FROM tags WHERE path = ?`, body.fromPath
+            ).toArray();
+            this.ctx.storage.sql.exec(`DELETE FROM tags WHERE path = ?`, body.fromPath);
+            for (const t of existingTags) {
+              this.ctx.storage.sql.exec(
+                `INSERT OR IGNORE INTO tags (path, tag) VALUES (?, ?)`,
+                body.toPath, (t as any).tag
+              );
+            }
+          }
+          this.ctx.storage.sql.exec(
+            `INSERT OR REPLACE INTO tombstones (path, deleted_at, deleted_by) VALUES (?, datetime('now'), 'mcp-claude')`,
+            body.fromPath
+          );
+          return Response.json({ ok: true });
+        }
+
+        case "clear_tombstones": {
+          this.ctx.storage.sql.exec(`DELETE FROM tombstones`);
+          return Response.json({ ok: true });
+        }
+
+        default:
+          return Response.json({ error: `Unknown index action: ${body.action}` }, { status: 400 });
+      }
+    }
+
     // Pass everything else to McpAgent's fetch handler (MCP protocol)
     return super.fetch(request);
   }
@@ -285,7 +459,8 @@ export class VaultAgent extends McpAgent<Env> {
   }
 
   async init() {
-    this.ensureDB();
+    // MCP tools forward all index operations to the canonical "vault" DO via indexOp().
+    // No local ensureDB() needed — per-session DOs don't use their own SQLite.
 
     // ---- vault_file: read, write, delete, move ----
 
@@ -329,39 +504,21 @@ export class VaultAgent extends McpAgent<Env> {
               },
             });
 
-            // Update DO SQLite index
+            // Update canonical vault DO index
             const frontmatter = parseFrontmatter(content);
             const tags = extractTags(content, frontmatter);
-
-            this.ctx.storage.sql.exec(
-              `INSERT OR REPLACE INTO files (path, content_hash, size_bytes, frontmatter_json, updated_at)
-               VALUES (?, ?, ?, ?, datetime('now'))`,
-              path, hash, sizeBytes, frontmatter ? JSON.stringify(frontmatter) : null
-            );
-
-            // Update tags
-            this.ctx.storage.sql.exec(`DELETE FROM tags WHERE path = ?`, path);
-            for (const tag of tags) {
-              this.ctx.storage.sql.exec(
-                `INSERT OR IGNORE INTO tags (path, tag) VALUES (?, ?)`,
-                path, tag
-              );
-            }
-
-            // Remove from tombstones if it was deleted
-            this.ctx.storage.sql.exec(`DELETE FROM tombstones WHERE path = ?`, path);
+            await this.indexOp("upsert_file", {
+              path, hash, sizeBytes,
+              frontmatterJson: frontmatter ? JSON.stringify(frontmatter) : null,
+              tags,
+            });
 
             return { content: [{ type: "text" as const, text: `Written: ${path} (${sizeBytes} bytes)` }] };
           }
 
           case "delete": {
             await this.env.VAULT_STORAGE.delete(vaultKey(path));
-            this.ctx.storage.sql.exec(`DELETE FROM files WHERE path = ?`, path);
-            this.ctx.storage.sql.exec(`DELETE FROM tags WHERE path = ?`, path);
-            this.ctx.storage.sql.exec(
-              `INSERT OR REPLACE INTO tombstones (path, deleted_at, deleted_by) VALUES (?, datetime('now'), 'mcp-claude')`,
-              path
-            );
+            await this.indexOp("delete_file", { path });
             return { content: [{ type: "text" as const, text: `Deleted: ${path}` }] };
           }
 
@@ -387,37 +544,8 @@ export class VaultAgent extends McpAgent<Env> {
             // Delete source
             await this.env.VAULT_STORAGE.delete(vaultKey(path));
 
-            // Update index
-            const row = this.ctx.storage.sql.exec(
-              `SELECT content_hash, size_bytes, frontmatter_json FROM files WHERE path = ?`, path
-            ).toArray()[0] as any;
-
-            if (row) {
-              this.ctx.storage.sql.exec(`DELETE FROM files WHERE path = ?`, path);
-              this.ctx.storage.sql.exec(
-                `INSERT OR REPLACE INTO files (path, content_hash, size_bytes, frontmatter_json, updated_at)
-                 VALUES (?, ?, ?, ?, datetime('now'))`,
-                destination, row.content_hash, row.size_bytes, row.frontmatter_json
-              );
-
-              // Move tags
-              const existingTags = this.ctx.storage.sql.exec(
-                `SELECT tag FROM tags WHERE path = ?`, path
-              ).toArray();
-              this.ctx.storage.sql.exec(`DELETE FROM tags WHERE path = ?`, path);
-              for (const t of existingTags) {
-                this.ctx.storage.sql.exec(
-                  `INSERT OR IGNORE INTO tags (path, tag) VALUES (?, ?)`,
-                  destination, (t as any).tag
-                );
-              }
-            }
-
-            // Tombstone old path so sync knows it was moved
-            this.ctx.storage.sql.exec(
-              `INSERT OR REPLACE INTO tombstones (path, deleted_at, deleted_by) VALUES (?, datetime('now'), 'mcp-claude')`,
-              path
-            );
+            // Update canonical vault DO index
+            await this.indexOp("move_file", { fromPath: path, toPath: destination });
 
             return { content: [{ type: "text" as const, text: `Moved: ${path} → ${destination}` }] };
           }
@@ -474,14 +602,11 @@ export class VaultAgent extends McpAgent<Env> {
             const lowerQuery = query.toLowerCase();
             const results: { path: string; snippet: string }[] = [];
 
-            // Search file index first (path + frontmatter)
+            // Search file index via canonical vault DO
             const escapedQuery = query.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
-            const indexMatches = this.ctx.storage.sql.exec(
-              `SELECT path, frontmatter_json FROM files WHERE path LIKE ? ESCAPE '\\' OR frontmatter_json LIKE ? ESCAPE '\\' LIMIT ?`,
-              `%${escapedQuery}%`, `%${escapedQuery}%`, limit || 20
-            ).toArray() as any[];
+            const indexResult = await this.indexOp("search", { escapedQuery, limit: limit || 20 });
 
-            for (const row of indexMatches) {
+            for (const row of indexResult.rows || []) {
               results.push({ path: row.path, snippet: `[matched in index]` });
             }
 
@@ -514,13 +639,11 @@ export class VaultAgent extends McpAgent<Env> {
           }
 
           case "recent": {
-            const rows = this.ctx.storage.sql.exec(
-              `SELECT path, size_bytes, updated_at FROM files ORDER BY updated_at DESC LIMIT ?`,
-              limit || 20
-            ).toArray() as any[];
+            const result = await this.indexOp("recent", { limit: limit || 20 });
+            const rows = result.rows || [];
 
             const text = rows.length
-              ? rows.map((r) => `${r.path} (${r.size_bytes}b, ${r.updated_at})`).join("\n")
+              ? rows.map((r: any) => `${r.path} (${r.size_bytes}b, ${r.updated_at})`).join("\n")
               : "No files indexed yet";
 
             return { content: [{ type: "text" as const, text }] };
@@ -528,25 +651,19 @@ export class VaultAgent extends McpAgent<Env> {
 
           case "tags": {
             if (tag) {
-              // Files with specific tag
-              const rows = this.ctx.storage.sql.exec(
-                `SELECT t.path FROM tags t WHERE t.tag = ? LIMIT ?`,
-                tag, limit || 50
-              ).toArray() as any[];
+              const result = await this.indexOp("tags_by_tag", { tag, limit: limit || 50 });
+              const rows = result.rows || [];
 
               const text = rows.length
-                ? `Files tagged #${tag}:\n${rows.map((r) => `  ${r.path}`).join("\n")}`
+                ? `Files tagged #${tag}:\n${rows.map((r: any) => `  ${r.path}`).join("\n")}`
                 : `No files with tag #${tag}`;
               return { content: [{ type: "text" as const, text }] };
             } else {
-              // All tags with counts
-              const rows = this.ctx.storage.sql.exec(
-                `SELECT tag, COUNT(*) as count FROM tags GROUP BY tag ORDER BY count DESC LIMIT ?`,
-                limit || 50
-              ).toArray() as any[];
+              const result = await this.indexOp("tags_all", { limit: limit || 50 });
+              const rows = result.rows || [];
 
               const text = rows.length
-                ? rows.map((r) => `#${r.tag} (${r.count})`).join("\n")
+                ? rows.map((r: any) => `#${r.tag} (${r.count})`).join("\n")
                 : "No tags indexed";
               return { content: [{ type: "text" as const, text }] };
             }
@@ -608,6 +725,7 @@ export class VaultAgent extends McpAgent<Env> {
 
             // Write back
             const hash = await hashContent(text);
+            const fmSizeBytes = new TextEncoder().encode(text).byteLength;
             await this.env.VAULT_STORAGE.put(vaultKey(path), text, {
               httpMetadata: { contentType: "text/markdown" },
               customMetadata: {
@@ -617,47 +735,26 @@ export class VaultAgent extends McpAgent<Env> {
               },
             });
 
-            // Update index
-            const fmSizeBytes = new TextEncoder().encode(text).byteLength;
-            this.ctx.storage.sql.exec(
-              `INSERT OR REPLACE INTO files (path, content_hash, size_bytes, frontmatter_json, updated_at)
-               VALUES (?, ?, ?, ?, datetime('now'))`,
-              path, hash, fmSizeBytes, JSON.stringify(merged)
-            );
-
-            // Refresh tags from updated content
+            // Update canonical vault DO index
             const fmTags = extractTags(text, merged);
-            this.ctx.storage.sql.exec(`DELETE FROM tags WHERE path = ?`, path);
-            for (const t of fmTags) {
-              this.ctx.storage.sql.exec(
-                `INSERT OR IGNORE INTO tags (path, tag) VALUES (?, ?)`,
-                path, t
-              );
-            }
+            await this.indexOp("upsert_file", {
+              path, hash, sizeBytes: fmSizeBytes,
+              frontmatterJson: JSON.stringify(merged),
+              tags: fmTags,
+            });
 
             return { content: [{ type: "text" as const, text: `Frontmatter updated: ${path}` }] };
           }
 
           case "stats": {
-            const fileCount = this.ctx.storage.sql.exec(
-              `SELECT COUNT(*) as count FROM files`
-            ).toArray()[0] as any;
-            const totalSize = this.ctx.storage.sql.exec(
-              `SELECT COALESCE(SUM(size_bytes), 0) as total FROM files`
-            ).toArray()[0] as any;
-            const tagCount = this.ctx.storage.sql.exec(
-              `SELECT COUNT(DISTINCT tag) as count FROM tags`
-            ).toArray()[0] as any;
-            const recentFile = this.ctx.storage.sql.exec(
-              `SELECT path, updated_at FROM files ORDER BY updated_at DESC LIMIT 1`
-            ).toArray()[0] as any;
+            const result = await this.indexOp("stats");
 
             const stats = {
-              files: fileCount?.count || 0,
-              total_size: `${((totalSize?.total || 0) / 1024 / 1024).toFixed(2)} MB`,
-              unique_tags: tagCount?.count || 0,
-              last_updated: recentFile?.updated_at || "never",
-              last_file: recentFile?.path || "none",
+              files: result.files,
+              total_size: `${((result.totalSize || 0) / 1024 / 1024).toFixed(2)} MB`,
+              unique_tags: result.uniqueTags,
+              last_updated: result.lastUpdated,
+              last_file: result.lastFile,
             };
 
             return {
@@ -668,7 +765,7 @@ export class VaultAgent extends McpAgent<Env> {
       }
     );
 
-    // ---- vault_sync: status, pull_changes, acknowledge ----
+    // ---- vault_sync: status, compare_manifest, acknowledge, reindex ----
 
     this.server.tool(
       "vault_sync",
@@ -683,24 +780,16 @@ export class VaultAgent extends McpAgent<Env> {
       async ({ action, manifest }) => {
         switch (action) {
           case "status": {
-            const fileCount = this.ctx.storage.sql.exec(
-              `SELECT COUNT(*) as count FROM files`
-            ).toArray()[0] as any;
-            const tombstoneCount = this.ctx.storage.sql.exec(
-              `SELECT COUNT(*) as count FROM tombstones`
-            ).toArray()[0] as any;
-
-            const reindexActive = await this.ctx.storage.get<boolean>("reindex_active");
-            const reindexCount = await this.ctx.storage.get<number>("reindex_count");
+            const result = await this.indexOp("status");
 
             return {
               content: [{
                 type: "text" as const,
                 text: JSON.stringify({
-                  indexed_files: fileCount?.count || 0,
-                  pending_deletes: tombstoneCount?.count || 0,
-                  reindex_in_progress: !!reindexActive,
-                  ...(reindexActive ? { reindex_files_processed: reindexCount || 0 } : {}),
+                  indexed_files: result.indexedFiles,
+                  pending_deletes: result.pendingDeletes,
+                  reindex_in_progress: result.reindexActive,
+                  ...(result.reindexActive ? { reindex_files_processed: result.reindexCount } : {}),
                   status: "ok",
                 }, null, 2),
               }],
@@ -712,37 +801,34 @@ export class VaultAgent extends McpAgent<Env> {
               return { content: [{ type: "text" as const, text: "Manifest required" }] };
             }
 
-            const serverFiles = this.ctx.storage.sql.exec(
-              `SELECT path, content_hash FROM files`
-            ).toArray() as any[];
+            const filesResult = await this.indexOp("files_manifest");
+            const serverFiles = filesResult.rows || [];
 
-            const serverMap = new Map(serverFiles.map((f) => [f.path, f.content_hash]));
+            const serverMap = new Map(serverFiles.map((f: any) => [f.path, f.content_hash]));
             const clientPaths = new Set(Object.keys(manifest));
 
-            const needsUpload: string[] = []; // client has newer
-            const needsDownload: string[] = []; // server has newer
-            const serverOnly: string[] = []; // server has, client doesn't
+            const needsUpload: string[] = [];
+            const needsDownload: string[] = [];
+            const serverOnly: string[] = [];
 
             for (const [path, hash] of Object.entries(manifest)) {
               const serverHash = serverMap.get(path);
               if (!serverHash) {
-                needsUpload.push(path); // new file on client
+                needsUpload.push(path);
               } else if (serverHash !== hash) {
-                needsDownload.push(path); // different — server wins for simplicity
+                needsDownload.push(path);
               }
             }
 
-            for (const [path] of serverMap) {
-              if (!clientPaths.has(path)) {
-                serverOnly.push(path);
+            for (const [p] of serverMap) {
+              if (!clientPaths.has(p as string)) {
+                serverOnly.push(p as string);
               }
             }
 
-            // Check tombstones — filter from needs_upload, report as deleted
-            const tombstones = this.ctx.storage.sql.exec(
-              `SELECT path FROM tombstones`
-            ).toArray() as any[];
-            const tombstoneSet = new Set(tombstones.map((t) => t.path));
+            // Check tombstones
+            const tombResult = await this.indexOp("tombstones");
+            const tombstoneSet = new Set((tombResult.rows || []).map((t: any) => t.path));
 
             const deletedOnServer = needsUpload.filter((p) => tombstoneSet.has(p));
             const filteredUpload = needsUpload.filter((p) => !tombstoneSet.has(p));
@@ -760,30 +846,22 @@ export class VaultAgent extends McpAgent<Env> {
           }
 
           case "acknowledge_sync": {
-            // Clear tombstones after plugin has processed them
-            this.ctx.storage.sql.exec(`DELETE FROM tombstones`);
+            await this.indexOp("clear_tombstones");
             return { content: [{ type: "text" as const, text: "Sync acknowledged, tombstones cleared" }] };
           }
 
           case "reindex": {
-            // Batched reindex using DO alarms — processes 50 files per invocation
-            // to stay within Cloudflare's subrequest limits
-            this.ctx.storage.sql.exec(`DELETE FROM files`);
-            this.ctx.storage.sql.exec(`DELETE FROM tags`);
+            // Forward to the canonical vault DO (which has the SQLite index)
+            const id = this.env.VAULT.idFromName("vault");
+            const stub = this.env.VAULT.get(id);
+            const resp = await stub.fetch(new Request("http://internal/reindex", { method: "POST" }));
+            const result = await resp.json() as any;
 
-            await this.ctx.storage.put("reindex_active", true);
-            await this.ctx.storage.put("reindex_count", 0);
-            await this.ctx.storage.delete("reindex_cursor");
-
-            // Process first batch inline
-            const result = await this.processReindexBatch();
-
-            if (result.hasMore) {
-              this.ctx.storage.setAlarm(Date.now() + 100);
+            if (result.in_progress) {
               return {
                 content: [{
                   type: "text" as const,
-                  text: `Reindex started — ${result.indexed} files indexed so far, continuing in background...`,
+                  text: `Reindex started — ${result.indexed_so_far} files indexed so far, continuing in background...`,
                 }],
               };
             }
@@ -791,7 +869,7 @@ export class VaultAgent extends McpAgent<Env> {
             return {
               content: [{
                 type: "text" as const,
-                text: `Reindex complete — ${result.indexed} files indexed`,
+                text: `Reindex complete — ${result.indexed_so_far} files indexed`,
               }],
             };
           }
