@@ -918,6 +918,25 @@ export default {
       return VaultAgent.serve("/mcp", { binding: "VAULT" }).fetch(request, env, ctx);
     }
 
+    // OAuth discovery probes must 404, not 401.
+    //
+    // Claude.ai asks for /.well-known/oauth-protected-resource before it
+    // connects. That path matches no route here, so it fell through to the
+    // sync-API gate below and answered 401 — which the client reads as "this
+    // resource is protected, begin OAuth". It then attempts Dynamic Client
+    // Registration against a worker that implements no OAuth at all, and the
+    // connector fails with "couldn't register with the sign-in service".
+    //
+    // The MCP surface (/sse, /mcp) is served above this gate and needs no
+    // credentials, so the honest answer to a discovery probe is "there is no
+    // OAuth here" — a 404. The client then connects directly.
+    //
+    // This does NOT loosen anything: the sync API below stays gated, and these
+    // paths never had a handler to reach.
+    if (url.pathname.startsWith("/.well-known/")) {
+      return jsonResponse({ error: "Not found" }, 404);
+    }
+
     // Auth check for sync API
     if (!authenticate(request, env)) {
       return jsonResponse({ error: "Unauthorized" }, 401);
